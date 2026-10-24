@@ -96,7 +96,7 @@ cap_text() {
 log_errors() {
     local text errs
     text=$(tr '\r' '\n' | grep -v '^[[:space:]]*$' || true)
-    errs=$(grep -E '^rsync(: |: \[|.*error)|Permission denied|No such file|Connection|Host key|^ssh:' <<< "$text" | tail -n 5 || true)
+    errs=$(grep -vE '^([<>ch.*][fdLDS]|\*deleting)' <<< "$text" | grep -E '^rsync(: |: \[|.*error)|Permission denied|No such file|Connection (refused|reset|closed|timed out)|Host key|^ssh:' | tail -n 5 || true)
     [[ -n "$errs" ]] || errs=$(tail -n 5 <<< "$text")
     cap_text "$errs"
 }
@@ -468,7 +468,7 @@ for rel_path in "${INCLUDE_PATHS[@]}"; do
     set -e
 
     # Show summary for this path
-    tail -n 30 "$RSYNC_LOG" | grep -E '^(sent |total size|files transferred|Total transferred file size)' || true
+    tail -n +"$((log_start + 1))" "$RSYNC_LOG" | grep -E '^(sent |total size|files transferred|Total transferred file size)' || true
 
     # 0 = ok, 24 = source files vanished mid-transfer (warning only).
     # 23 (partial transfer, e.g. permission denied) and everything else is a failure.
