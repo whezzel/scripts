@@ -394,7 +394,7 @@ format_itemize_line() {
 
     if [[ "$line" =~ ^(.)([fdLDS])(.{9})[[:space:]](.*) ]]; then
         local prefix="${BASH_REMATCH[1]}"
-        [[ "$prefix" == ">" || "$prefix" == "c" ]] || return
+        [[ "$prefix" == "<" || "$prefix" == ">" || "$prefix" == "c" ]] || return
         local type="${BASH_REMATCH[2]}"
         local code="${BASH_REMATCH[3]}"
         local path="${BASH_REMATCH[4]}"
@@ -433,7 +433,7 @@ write_debug_log() {
         echo "--- Transferred files ---"
         # `|| true`: a run with no changes has no itemize lines, and grep's
         # exit 1 would otherwise abort the whole script under pipefail + set -e
-        { grep -E '^[>c][fdLDS]|^\*deleting' "$rsync_log" || true; } | while IFS= read -r line; do
+        { grep -E '^[<>c][fdLDS]|^\*deleting' "$rsync_log" || true; } | while IFS= read -r line; do
             format_itemize_line "$line"
         done
     } > "$debug_log"
@@ -645,7 +645,7 @@ set -e
 RSYNC_OUTPUT=$(<"$RSYNC_LOG")
 
 # Show clean stats (hide itemize lines and harmless vanished-file messages)
-echo "$RSYNC_OUTPUT" | grep -Ev '^[>c][fdLDS]|^\*deleting|link_stat .* failed: No such file or directory|rsync error: some files/attrs were not transferred' | tail -n 50 || true
+echo "$RSYNC_OUTPUT" | grep -Ev '^[<>c][fdLDS]|^\*deleting|link_stat .* failed: No such file or directory|rsync error: some files/attrs were not transferred' | tail -n 50 || true
 
 # 0 = ok, 24 = files vanished during the live backup (normal, warning only).
 # 23 (partial transfer: permission denied, unreadable files, ...) and anything
