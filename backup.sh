@@ -18,12 +18,14 @@ EXCLUDE_DIRS=(
     "temp"
     ".cache"
     ".cargo"
+    ".cmake"
 
     # === Shell / dotfiles ===
     ".bash_history"
     ".bash_logout"
     ".bash_profile"
     ".bashrc"
+    "documents/age.key"
 
     # === Browser caches - Brave (wildcards for all profiles) ===
     ".config/BraveSoftware/Brave-Browser/**/AutofillStrikeDatabase"
@@ -107,11 +109,14 @@ EXCLUDE_DIRS=(
     # === Other apps ===
     ".config/Element/EventStore"
     ".config/Element/Cache"
+    ".config/Element/VideoDecodeStats"
+    ".config/Element/shared_proto_db"
     ".thunderbird/*/Cache"
     ".thunderbird/*/datareporting"
     ".thunderbird/*/startupCache"
     ".local/share/ranger/"
     ".oh-my-zsh/cache/"
+    ".wine"
 
     # === General caches (very effective broad patterns) ===
     "**/blob_storage"
@@ -145,8 +150,10 @@ EXCLUDE_DIRS=(
     ".local/share/kactivitymanagerd"
     ".local/share/klipper/data"
     ".local/share/libkunitconversion"
+".local/share/locale"
     ".local/share/Steam"
     ".local/share/Trash"
+".local/share/yarn"
     ".local/state"
     ".mcli"
     ".mono"
@@ -172,6 +179,17 @@ MIN_BACKUPS=2
 MIN_FREE_SPACE_MB=1024
 ENABLE_DEBUG_LOG=1
 GOTIFY_URL="https://gotify.whezzel.com"
+# systemd --user keeps a session-long copy of the environment. Load the
+# token from the same file interactive shells use so a roll takes effect
+# without a logout.
+if [[ -r "${HOME}/.shell/env" ]]; then
+    GOTIFY_TOKEN="$(
+        set +u
+        # shellcheck disable=SC1091
+        source "${HOME}/.shell/env"
+        printf '%s' "${GOTIFY_TOKEN:-}"
+    )"
+fi
 : "${GOTIFY_TOKEN?Error: GOTIFY_TOKEN not set}"
 
 HOSTNAME="$(hostnamectl hostname)"
@@ -188,11 +206,13 @@ SSH_OPTS=(
 
 # ==================== FUNCTIONS ====================
 send_gotify() {
-    curl -s -X POST \
+if !     curl -sS -f -X POST \
         -F "title=$1" \
         -F "message=$2" \
         -F "priority=${3:-5}" \
-        "$GOTIFY_URL/message?token=$GOTIFY_TOKEN" >/dev/null || true
+        "$GOTIFY_URL/message?token=$GOTIFY_TOKEN" >/dev/null; then
+        echo "Gotify notification failed" >&2
+    fi
 }
 
 # All pruning in ONE SSH call
