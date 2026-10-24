@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Remote commands are built locally on purpose (paths expand client side):
+# shellcheck disable=SC2029
 
 set -euo pipefail
 
@@ -150,10 +152,10 @@ EXCLUDE_DIRS=(
     ".local/share/kactivitymanagerd"
     ".local/share/klipper/data"
     ".local/share/libkunitconversion"
-".local/share/locale"
+    ".local/share/locale"
     ".local/share/Steam"
     ".local/share/Trash"
-".local/share/yarn"
+    ".local/share/yarn"
     ".local/state"
     ".mcli"
     ".mono"
@@ -206,7 +208,7 @@ SSH_OPTS=(
 
 # ==================== FUNCTIONS ====================
 send_gotify() {
-if !     curl -sS -f -X POST \
+    if ! curl -sS -f -X POST \
         -F "title=$1" \
         -F "message=$2" \
         -F "priority=${3:-5}" \
