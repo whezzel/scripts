@@ -5,8 +5,9 @@
 set -euo pipefail
 
 # ==================== CONFIG ====================
-REMOTE_HOST="rsync"
-REMOTE_BACKUP_ROOT="/mnt/vg1000-lv/backups/$(hostnamectl hostname)"
+# ssh alias (~/.ssh/config); BACKUP_REMOTE_HOST overrides it for a one-off run
+REMOTE_HOST="${BACKUP_REMOTE_HOST:-rsync}"
+REMOTE_BACKUP_ROOT="/mnt/vg1000-lv/backups/$(hostnamectl hostname 2>/dev/null || uname -n)"
 EXCLUDE_DIRS=(
     # === General large dirs ===
     "docker/ollama/ollama/id_ed25519"
@@ -21,6 +22,7 @@ EXCLUDE_DIRS=(
     ".cache"
     ".cargo"
     ".cmake"
+    ".grok/sandbox-blocked*"
 
     # === Shell / dotfiles ===
     ".bash_history"
@@ -140,7 +142,10 @@ EXCLUDE_DIRS=(
     ".docker"
     ".dotnet"
     ".fastboot"
-    ".gnupg"
+    # .gnupg itself is backed up (keys, trustdb); only its runtime sockets and locks are skipped
+    ".gnupg/S.*"
+    ".gnupg/*.lock"
+    ".gnupg/**/*.lock"
     ".go"
     ".gradle"
     ".grok/marketplace-cache"
@@ -175,7 +180,7 @@ EXCLUDE_DIRS=(
     ".yarnrc"
     ".zcompdump-*"
 )
-MAX_AGE_DAYS=15
+MAX_AGE_DAYS=30
 MAX_BACKUP_SIZE_GB=250
 MIN_BACKUPS=2
 MIN_FREE_SPACE_MB=1024
@@ -194,7 +199,7 @@ if [[ -r "${HOME}/.shell/env" ]]; then
 fi
 : "${GOTIFY_TOKEN?Error: GOTIFY_TOKEN not set}"
 
-HOSTNAME="$(hostnamectl hostname)"
+HOSTNAME="$(hostnamectl hostname 2>/dev/null || uname -n)"
 
 # SSH multiplexing
 SSH_CONTROL_PATH="/tmp/ssh-control-backup-$$"
@@ -208,7 +213,7 @@ SSH_OPTS=(
 
 # ==================== FUNCTIONS ====================
 send_gotify() {
-    if ! curl -sS -f -X POST \
+    if ! curl -sS -f --max-time 30 -X POST \
         -F "title=$1" \
         -F "message=$2" \
         -F "priority=${3:-5}" \
@@ -217,7 +222,52 @@ send_gotify() {
     fi
 }
 
-# All pruning in ONE SSH call
+# Maximum length of the error detail appended to a failure alert
+ERR_MAX_CHARS=800
+
+cap_text() {
+    local t="$1"
+    if (( ${#t} > ERR_MAX_CHARS )); then
+        t="${t:0:ERR_MAX_CHARS}…"
+    fi
+    printf '%s' "$t"
+}
+
+# Reads a log on stdin and prints its last 5 rsync/ssh error lines, or its
+# last 5 non-empty lines when no error line matches, capped at ERR_MAX_CHARS.
+log_errors() {
+    local text errs
+    text=$(tr '\r' '\n' | grep -v '^[[:space:]]*$' || true)
+    errs=$(grep -E '^rsync(: |: \[|.*error)|Permission denied|No such file|Connection|Host key|^ssh:' <<< "$text" | tail -n 5 || true)
+    [[ -n "$errs" ]] || errs=$(tail -n 5 <<< "$text")
+    cap_text "$errs"
+}
+
+# Text for a failed ssh call: its exit code (255 = ssh itself failed) and stderr
+ssh_error() {
+    local rc="$1" file="$2" what
+    if (( rc == 255 )); then
+        what="ssh to ${REMOTE_HOST} failed (exit 255)"
+    else
+        what="remote command failed (exit ${rc})"
+    fi
+    printf '%s: %s' "$what" "$(log_errors < "$file")"
+}
+
+# Describes the current holder of a lock file written as "PID start-time"
+lock_holder() {
+    local pid="" started=""
+    read -r pid started 2>/dev/null < "$1" || true
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+        printf 'held by PID %s, running since %s: %s' "$pid" "$started" \
+            "$(ps -o args= -p "$pid" 2>/dev/null | cut -c1-120)"
+    else
+        printf 'held by a process that did not record its PID'
+    fi
+}
+
+# All pruning in ONE SSH call. Only completed snapshots (backup-*) are
+# considered; .inprogress-* never is, and the target of `latest` is never deleted.
 remote_prune() {
     ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" \
         env \
@@ -231,67 +281,105 @@ remote_prune() {
         ROOT="${REMOTE_BACKUP_ROOT}"
         MAX_BYTES=$(( MAX_BACKUP_SIZE_GB * 1024**3 ))
         MIN_BACKUPS=${MIN_BACKUPS:-2}
+        NOW=$(date +%s)
+        RC=0
 
         cd "$ROOT" 2>/dev/null || exit 0
 
-        # Age pruning (find -delete fails on non-empty dirs when -maxdepth 1)
-        if (( MAX_AGE_DAYS > 0 )); then
-            mapfile -t old_backups < <(
-                find "$ROOT" -maxdepth 1 -type d -name "backup-*" -mtime +${MAX_AGE_DAYS} \
-                    -printf '%T@ %p\n' 2>/dev/null | sort -n | cut -d' ' -f2-
-            )
-
-            if (( ${#old_backups[@]} > 0 )); then
-                echo "Pruning by age (>${MAX_AGE_DAYS} days, ${#old_backups[@]} backups)"
-                echo "Pruning by age (>${MAX_AGE_DAYS} days, ${#old_backups[@]} backups)" >> "${ROOT}/prune.log"
-                for dir in "${old_backups[@]}"; do
-                    [[ ! -d "$dir" ]] && continue
-                    remaining=$(find "$ROOT" -maxdepth 1 -type d -name "backup-*" 2>/dev/null | wc -l)
-                    if (( remaining <= MIN_BACKUPS )); then
-                        echo "  Keeping ${dir##*/} (min backups=${MIN_BACKUPS})"
-                        echo "  Keeping ${dir##*/} (min backups=${MIN_BACKUPS})" >> "${ROOT}/prune.log"
-                        break
-                    fi
-                    size=$(du -sb "$dir" 2>/dev/null | cut -f1 || echo 0)
-                    rm -rf "$dir" 2>/dev/null || true
-                    echo "  Deleted ${dir##*/} (age, $((size/1024**3)) GB)" >> "${ROOT}/prune.log"
-                    echo "  Deleted ${dir##*/} (age, $((size/1024**3)) GB)"
-                done
-            else
-                echo "No backups older than ${MAX_AGE_DAYS} days"
-            fi
+        if [[ -e latest && ! -L latest ]]; then
+            echo "  Stopping prune: ${ROOT}/latest is not a symlink"
+            exit 3
         fi
 
-        # Size pruning
-        total_bytes=$(du -scb backup-* 2>/dev/null | tail -n1 | cut -f1 || echo 0)
+        plog() { echo "$1"; echo "$1" >> "${ROOT}/prune.log"; }
+
+        # Age in whole days from the stamp in the name, mtime as fallback
+        age_days() {
+            local name="$1" stamp ts
+            stamp="${name#backup-}"
+            if [[ "$stamp" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2})_([0-9]{2})-([0-9]{2})-([0-9]{2})$ ]] &&
+                ts=$(date -d "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}:${BASH_REMATCH[3]}:${BASH_REMATCH[4]}" +%s 2>/dev/null); then
+                :
+            else
+                ts=$(stat -c %Y -- "$name" 2>/dev/null || echo "$NOW")
+            fi
+            echo $(( (NOW - ts) / 86400 ))
+        }
+
+        # Finish deletions an earlier prune could not complete
+        rm -rf -- .deleting-backup-* 2>/dev/null || true
+
+        LATEST_TARGET=$(readlink -e latest 2>/dev/null || true)
+        LATEST_TARGET="${LATEST_TARGET##*/}"
+
+        # Completed snapshots, newest first (the stamp in the name sorts chronologically)
+        mapfile -t snaps < <(find . -maxdepth 1 -type d -name "backup-*" -printf '%f\n' 2>/dev/null | sort -r)
+        count=${#snaps[@]}
+        if (( count == 0 )); then
+            echo "FINAL_TOTAL:0"
+            exit 0
+        fi
+
+        # ONE du pass, newest first: GNU du charges each inode to the first path
+        # it meets, so each figure is exactly what deleting that snapshot frees
+        # once all older ones are gone, and the figures sum to the real total.
+        declare -A free_bytes=()
+        total_bytes=0
+        while IFS=$'\t' read -r size name; do
+            free_bytes["$name"]=$size
+            total_bytes=$(( total_bytes + size ))
+        done < <(du -sb -- "${snaps[@]}" 2>/dev/null)
+
+        plog "Prune: $(date '+%F %H:%M:%S') ${count} snapshots, $((total_bytes/1024**3)) GB (limit ${MAX_BACKUP_SIZE_GB} GB, max age ${MAX_AGE_DAYS} days, min ${MIN_BACKUPS})"
+
+        for (( i = count - 1; i >= 0; i-- )); do
+            dir="${snaps[i]}"
+            reason=""
+            if (( MAX_AGE_DAYS > 0 )); then
+                age=$(age_days "$dir")
+                if (( age > MAX_AGE_DAYS )); then
+                    reason="age ${age}d"
+                fi
+            fi
+            if [[ -z "$reason" ]] && (( total_bytes > MAX_BYTES )); then
+                reason="size"
+            fi
+            [[ -n "$reason" ]] || break
+
+            if (( count <= MIN_BACKUPS )); then
+                plog "  Keeping ${dir} (min backups=${MIN_BACKUPS})"
+                break
+            fi
+            if [[ "$dir" == "$LATEST_TARGET" ]]; then
+                plog "  Keeping ${dir} (target of latest)"
+                break
+            fi
+            if [[ -z "${free_bytes[$dir]:-}" ]]; then
+                plog "  Stopping prune: no du figure for ${dir}"
+                RC=1
+                break
+            fi
+
+            # Rename first so a half-deleted snapshot can never look complete
+            if ! del_err=$( { mv -T -- "$dir" ".deleting-${dir}" && rm -rf -- ".deleting-${dir}"; } 2>&1 ); then
+                plog "  Stopping prune: failed to delete ${dir}: $(tail -n 2 <<< "$del_err" | tr '\n' ' ' | cut -c1-300)"
+                RC=1
+                break
+            fi
+            size=${free_bytes[$dir]}
+            count=$(( count - 1 ))
+            total_bytes=$(( total_bytes - size ))
+            plog "  Deleted ${dir} (${reason}, freed $((size/1024**3)) GB, new total $((total_bytes/1024**3)) GB, ${count} left)"
+        done
 
         if (( total_bytes > MAX_BYTES )); then
-            echo "Pruning by size ($((total_bytes/1024**3)) GB > limit)"
-            echo "Pruning by size ($((total_bytes/1024**3)) GB > limit)" >> "${ROOT}/prune.log"
-
-            mapfile -t backups < <(find . -maxdepth 1 -type d -name "backup-*" -printf "%T@ %p\n" 2>/dev/null | sort -n | cut -d" " -f2-)
-
-            for dir in "${backups[@]}"; do
-                [[ ! -d "$dir" ]] && continue
-                remaining=$(find . -maxdepth 1 -type d -name "backup-*" 2>/dev/null | wc -l)
-                if (( remaining <= MIN_BACKUPS )); then
-                    echo "  Stopping size prune (min backups=${MIN_BACKUPS})"
-                    echo "  Stopping size prune (min backups=${MIN_BACKUPS})" >> "${ROOT}/prune.log"
-                    break
-                fi
-                size=$(du -sb "$dir" 2>/dev/null | cut -f1 || echo 0)
-                rm -rf "$dir" 2>/dev/null || true
-                total_bytes=$((total_bytes - size))
-                echo "  Deleted ${dir#./} (size, $((size/1024**3)) GB, new total $((total_bytes/1024**3)) GB)" >> "${ROOT}/prune.log"
-                echo "  Deleted ${dir#./} (size, $((size/1024**3)) GB, new total $((total_bytes/1024**3)) GB)"
-                (( total_bytes <= MAX_BYTES )) && break
-            done
+            plog "  Still over size limit: $((total_bytes/1024**3)) GB"
         else
             echo "Total size within limit ($((total_bytes/1024**3)) GB)"
         fi
 
-        final_total=$(du -scb backup-* 2>/dev/null | tail -n1 | cut -f1 || echo 0)
-        echo "FINAL_TOTAL:${final_total}"
+        echo "FINAL_TOTAL:${total_bytes}"
+        exit "$RC"
 EOF
 }
 
@@ -343,7 +431,9 @@ write_debug_log() {
         [[ -n "${LINK_DEST_DISPLAY:-}" ]] && echo "Link-dest: ${LINK_DEST_DISPLAY}"
         echo ""
         echo "--- Transferred files ---"
-        grep -E '^[>c][fdLDS]|^\*deleting' "$rsync_log" | while IFS= read -r line; do
+        # `|| true`: a run with no changes has no itemize lines, and grep's
+        # exit 1 would otherwise abort the whole script under pipefail + set -e
+        { grep -E '^[>c][fdLDS]|^\*deleting' "$rsync_log" || true; } | while IFS= read -r line; do
             format_itemize_line "$line"
         done
     } > "$debug_log"
@@ -362,49 +452,172 @@ bytes_to_human() {
     }'
 }
 
+# ==================== FAILURE HANDLING ====================
+# Every failure notifies before the script exits non-zero:
+#  - known failures call fail(), which notifies and exits 1
+#  - anything else (set -e, a signal, systemd's timeout) ends in the EXIT trap,
+#    which notifies only if fail() has not already done so (no double notify)
+FAIL_TITLE="❌ Backup Failed on ${HOSTNAME}"
+NOTIFIED=0
+ERR_LINE=""
+ERR_CMD=""
+ERR_RC=""
+ERR_FILE=""
+EXCLUDE_FILE=""
+RSYNC_LOG=""
+DEBUG_LOG_FILE=""
+WORK_NAME=""
+
+fail() {
+    echo "$1" >&2
+    send_gotify "$FAIL_TITLE" "$1" "${2:-10}"
+    NOTIFIED=1
+    exit 1
+}
+
+# shellcheck disable=SC2317,SC2329  # only invoked through the EXIT trap
+on_exit() {
+    local rc=$? msg
+    trap - EXIT
+    rm -f ${EXCLUDE_FILE:+"$EXCLUDE_FILE"} ${RSYNC_LOG:+"$RSYNC_LOG"} ${DEBUG_LOG_FILE:+"$DEBUG_LOG_FILE"} ${ERR_FILE:+"$ERR_FILE"} 2>/dev/null || true
+    if [[ -S "$SSH_CONTROL_PATH" ]]; then
+        ssh "${SSH_OPTS[@]}" -O exit "$REMOTE_HOST" 2>/dev/null || true
+    fi
+    rm -f "${SSH_CONTROL_PATH}"* 2>/dev/null || true
+    if (( rc != 0 && NOTIFIED == 0 )); then
+        msg="❌ Aborted unexpectedly (exit ${rc})"
+        case "$rc" in
+            129) msg+=": killed by SIGHUP" ;;
+            130) msg+=": interrupted by SIGINT (Ctrl-C)" ;;
+            143) msg+=": killed by SIGTERM (systemctl stop or TimeoutStartSec)" ;;
+            *) [[ -n "$ERR_LINE" ]] && msg+=": \`${ERR_CMD}\` failed with exit ${ERR_RC} at line ${ERR_LINE}" ;;
+        esac
+        [[ -n "$WORK_NAME" ]] && msg+="
+Work dir on the NAS (resumed next run): ${WORK_NAME}"
+        msg+="
+Full output: journalctl --user -e"
+        echo "$msg" >&2
+        send_gotify "$FAIL_TITLE" "$msg" 10
+    fi
+    exit "$rc"
+}
+
+set -E
+trap 'ERR_RC=$?; ERR_LINE=$LINENO; ERR_CMD=$BASH_COMMAND' ERR
+trap on_exit EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 # ==================== MAIN ====================
-# Prevent concurrent runs
-exec 9>"${XDG_RUNTIME_DIR:-/tmp}/backup-home.lock"
+# Prevent concurrent runs (per-user runtime dir; /tmp only if neither exists)
+LOCK_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+[[ -d "$LOCK_DIR" && -w "$LOCK_DIR" ]] || LOCK_DIR="/tmp"
+LOCK_FILE="${LOCK_DIR}/backup-home.lock"
+exec 9>>"$LOCK_FILE"
 if ! flock -n 9; then
-    echo "Another backup is already running" >&2
-    exit 0
+    fail "⚠️ Another home backup is already running, this run was skipped (lock ${LOCK_FILE} $(lock_holder "$LOCK_FILE"))" 5
 fi
+printf '%s %s\n' "$$" "$(date '+%F %H:%M:%S')" > "$LOCK_FILE"
 
 echo "=== Backup started at $(date '+%F %H:%M:%S') ==="
 
-EXCLUDE_FILE=$(mktemp)
-RSYNC_LOG=$(mktemp)
-DEBUG_LOG_FILE=$(mktemp)
-
-trap 'rm -f "$EXCLUDE_FILE" "$RSYNC_LOG" "$DEBUG_LOG_FILE" 2>/dev/null || true
-      ssh "${SSH_OPTS[@]}" -O exit "$REMOTE_HOST" 2>/dev/null || true
-      rm -f "${SSH_CONTROL_PATH}"* 2>/dev/null || true' EXIT
+for tmp_var in EXCLUDE_FILE RSYNC_LOG DEBUG_LOG_FILE ERR_FILE; do
+    if ! tmp_path=$(mktemp 2>&1); then
+        fail "❌ Could not create temp files (TMPDIR=${TMPDIR:-/tmp}): ${tmp_path}"
+    fi
+    printf -v "$tmp_var" '%s' "$tmp_path"
+done
 
 # Start persistent SSH connection
 ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" exit 0 2>/dev/null || true
 
+# Pruning runs BEFORE the free-space check so a nearly full NAS can recover by
+# itself. Only completed backup-* snapshots are considered, at least
+# MIN_BACKUPS are kept and the target of `latest` is never deleted.
+echo "Pruning old backups..."
+PRUNE_WARN=""
+set +e
+PRUNE_OUTPUT=$(remote_prune 2>"$ERR_FILE")
+prune_exit=$?
+set -e
+if (( prune_exit != 0 )); then
+    PRUNE_WARN="⚠️ Pruning incomplete (exit ${prune_exit}): $( { grep -E 'Stopping prune' <<< "$PRUNE_OUTPUT" || true; cat "$ERR_FILE"; } | log_errors)
+(log: ${REMOTE_BACKUP_ROOT}/prune.log on the NAS)"
+    echo "$PRUNE_WARN" >&2
+fi
+echo "$PRUNE_OUTPUT" | grep -E '^(Prune:|Total size within limit|  Deleted|  Keeping|  Stopping|  Still over|FINAL_TOTAL:)' || true
+PRUNED_TOTAL=$(echo "$PRUNE_OUTPUT" | grep -oP 'FINAL_TOTAL:\K[0-9]+' || echo 0)
+PRUNED_TOTAL=${PRUNED_TOTAL:-0}
+
 # Connectivity + disk space
 echo "Checking remote server..."
+set +e
 FREE_MB=$(ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" "
     df --output=avail -m \"\$(dirname '${REMOTE_BACKUP_ROOT}')\" | tail -n1
-" || echo 0)
-
-if ! [[ "$FREE_MB" =~ ^[0-9]+$ ]] || (( FREE_MB < MIN_FREE_SPACE_MB )); then
-    send_gotify "❌ Backup Failed on ${HOSTNAME}" "❌ Low space on NAS: ${FREE_MB} MB free" 10
-    exit 1
+" 2>"$ERR_FILE")
+df_exit=$?
+set -e
+if (( df_exit != 0 )); then
+    fail "❌ Cannot check free space on ${REMOTE_HOST}: $(ssh_error "$df_exit" "$ERR_FILE")"
+fi
+FREE_MB="${FREE_MB// /}"
+PRUNE_RESULT=$(grep -E '^(  Deleted|  Keeping|  Stopping|  Still over|Total size within limit)' <<< "$PRUNE_OUTPUT" | tail -n 3 || true)
+if ! [[ "$FREE_MB" =~ ^[0-9]+$ ]]; then
+    fail "❌ Could not read free space on the NAS: df printed '$(cap_text "$FREE_MB")'$( [[ -s "$ERR_FILE" ]] && printf '\n%s' "$(log_errors < "$ERR_FILE")")"
+elif (( FREE_MB < MIN_FREE_SPACE_MB )); then
+    fail "❌ Low space on NAS: ${FREE_MB} MB free after pruning (need ${MIN_FREE_SPACE_MB} MB)${PRUNE_RESULT:+
+Prune result:
+${PRUNE_RESULT}}${PRUNE_WARN:+
+${PRUNE_WARN}}"
 fi
 
 # Prepare new backup
 DATE=$(date +%Y-%m-%d_%H-%M-%S)
 BACKUP_NAME="backup-${DATE}"
+# Final name; it only appears on nas01 once the run has fully succeeded
 NEW_BACKUP_DIR="${REMOTE_BACKUP_ROOT}/${BACKUP_NAME}"
+# Work dir; never matches backup-*, so it is never link-dest and never pruned
+WORK_DIR="${REMOTE_BACKUP_ROOT}/.inprogress-${DATE}"
 
-PREV_BACKUP_DIR=$(ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" "
-    find '${REMOTE_BACKUP_ROOT}' -maxdepth 1 -type d -name 'backup-*' ! -name 'backup-${DATE}' \
-    -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n1 | cut -d' ' -f2-
-" || echo "")
-
-ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" "mkdir -p '${NEW_BACKUP_DIR}'"
+# One SSH call: check `latest`, resume a leftover work dir (or create a new one)
+# and print the link-dest snapshot (latest's target, else newest backup-*).
+set +e
+PREV_BACKUP_DIR=$(ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" \
+    env \
+    REMOTE_BACKUP_ROOT="${REMOTE_BACKUP_ROOT}" \
+    WORK_NAME="${WORK_DIR##*/}" \
+    /usr/bin/env bash 2>"$ERR_FILE" << 'EOF'
+    set -euo pipefail
+    mkdir -p "$REMOTE_BACKUP_ROOT"
+    cd "$REMOTE_BACKUP_ROOT"
+    if [[ -e latest && ! -L latest ]]; then
+        echo "${REMOTE_BACKUP_ROOT}/latest exists but is not a symlink" >&2
+        exit 3
+    fi
+    leftover=$(find . -maxdepth 1 -type d -name ".inprogress-*" -printf '%f\n' | sort -r | head -n1 || true)
+    if [[ -n "$leftover" ]]; then
+        echo "Resuming interrupted run ${leftover} as ${WORK_NAME}" >&2
+        [[ "$leftover" == "$WORK_NAME" ]] || mv -T "$leftover" "$WORK_NAME"
+    else
+        mkdir "$WORK_NAME"
+    fi
+    prev=$(readlink -e latest 2>/dev/null || true)
+    if [[ ! -d "$prev" || "${prev##*/}" != backup-* ]]; then
+        prev=$(find "$REMOTE_BACKUP_ROOT" -maxdepth 1 -type d -name "backup-*" -printf '%p\n' | sort -r | head -n1 || true)
+    fi
+    printf '%s\n' "$prev"
+EOF
+)
+prep_exit=$?
+set -e
+cat "$ERR_FILE" >&2
+if (( prep_exit == 3 )); then
+    fail "❌ ${REMOTE_BACKUP_ROOT}/latest on the NAS is not a symlink, fix it by hand"
+elif (( prep_exit != 0 )); then
+    fail "❌ Could not prepare the backup dir on the NAS: $(ssh_error "$prep_exit" "$ERR_FILE")"
+fi
+WORK_NAME="${WORK_DIR##*/}"
 
 LINK_DEST_ARGS=()
 LINK_DEST_DISPLAY=""
@@ -425,23 +638,32 @@ rsync -aH --delete --stats --info=progress2,stats2 --partial \
     --ignore-missing-args --delete-missing-args \
     "${LINK_DEST_ARGS[@]}" \
     --exclude-from="$EXCLUDE_FILE" \
-    "$HOME/" "$REMOTE_HOST:${NEW_BACKUP_DIR}/home/" > "$RSYNC_LOG" 2>&1
+    "$HOME/" "$REMOTE_HOST:${WORK_DIR}/home/" > "$RSYNC_LOG" 2>&1
 rsync_exit=$?
 set -e
 
 RSYNC_OUTPUT=$(<"$RSYNC_LOG")
 
 # Show clean stats (hide itemize lines and harmless vanished-file messages)
-echo "$RSYNC_OUTPUT" | grep -Ev '^[>c][fdLDS]|^\*deleting|link_stat .* failed: No such file or directory|rsync error: some files/attrs were not transferred' | tail -n 50
+echo "$RSYNC_OUTPUT" | grep -Ev '^[>c][fdLDS]|^\*deleting|link_stat .* failed: No such file or directory|rsync error: some files/attrs were not transferred' | tail -n 50 || true
 
-if [ $rsync_exit -eq 0 ] || [ $rsync_exit -eq 23 ] || [ $rsync_exit -eq 24 ]; then
-    if [ $rsync_exit -ne 0 ]; then
-        echo "⚠️  Rsync completed with code $rsync_exit (some files vanished during live backup - normal & harmless)"
+# 0 = ok, 24 = files vanished during the live backup (normal, warning only).
+# 23 (partial transfer: permission denied, unreadable files, ...) and anything
+# else is a failure. The work dir stays on nas01 and the next run resumes it.
+VANISHED_WARN=""
+if [ $rsync_exit -eq 0 ] || [ $rsync_exit -eq 24 ]; then
+    if [ $rsync_exit -eq 24 ]; then
+        echo "⚠️  Rsync completed with code 24 (some files vanished during live backup - normal & harmless)"
+        VANISHED_WARN="⚠️ Some files vanished during transfer (exit 24)"
     fi
 else
     echo "❌ Rsync failed with exit code $rsync_exit"
-    send_gotify "❌ Backup Failed on ${HOSTNAME}" "❌ Rsync failed (exit code $rsync_exit)" 10
-    exit 1
+    if [ $rsync_exit -eq 23 ]; then
+        grep -E 'Permission denied|failed:' "$RSYNC_LOG" | head -n 20 >&2 || true
+    fi
+    fail "❌ Rsync failed (exit code $rsync_exit)
+$(log_errors < "$RSYNC_LOG")
+Work dir kept for resume: ${WORK_NAME}"
 fi
 
 # Extract sizes reliably
@@ -454,39 +676,51 @@ TRANSFERRED_FILE_COUNT=0
 if (( ENABLE_DEBUG_LOG )); then
     write_debug_log "$RSYNC_LOG" "$DEBUG_LOG_FILE"
     TRANSFERRED_FILE_COUNT=$(grep -cE '^(NEW|CHANGED|DELETED|NEW DIR|NEW LINK)' "$DEBUG_LOG_FILE" || true)
-    ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" "cat > '${DEBUG_LOG_REMOTE}'" < "$DEBUG_LOG_FILE"
+    set +e
+    ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" "cat > '${WORK_DIR}/debug.log'" < "$DEBUG_LOG_FILE" 2>"$ERR_FILE"
+    dbg_exit=$?
+    set -e
+    if (( dbg_exit != 0 )); then
+        fail "❌ Could not write ${WORK_NAME}/debug.log on the NAS: $(ssh_error "$dbg_exit" "$ERR_FILE")
+Work dir kept for resume: ${WORK_NAME}"
+    fi
     echo "Debug log: ${DEBUG_LOG_REMOTE} (${TRANSFERRED_FILE_COUNT} entries)"
 fi
 
-# Record size for future fast pruning
-ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" "du -sb '${NEW_BACKUP_DIR}' 2>/dev/null | cut -f1 > '${NEW_BACKUP_DIR}/.backup-size'" || true
+# Publish on nas01: final name only now, then swap `latest` atomically
+set +e
+ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" \
+    "cd '${REMOTE_BACKUP_ROOT}' && mv -T '${WORK_NAME}' '${BACKUP_NAME}' && ln -sfn '${BACKUP_NAME}' latest.new && mv -T latest.new latest" 2>"$ERR_FILE"
+pub_exit=$?
+set -e
+if (( pub_exit != 0 )); then
+    fail "❌ Rsync ok but publishing ${BACKUP_NAME} failed: $(ssh_error "$pub_exit" "$ERR_FILE")
+Check ${REMOTE_BACKUP_ROOT} on the NAS"
+fi
+WORK_NAME=""
+echo "Published ${BACKUP_NAME} and updated latest"
 
-# Pruning
-echo "Pruning old backups..."
-PRUNE_OUTPUT=$(remote_prune)
-
-# Show clean pruning output
-echo "$PRUNE_OUTPUT" | grep -E '^(Pruning by age|Pruning by size|No backups older|Total size within limit|  Deleted|  Keeping|  Stopping|FINAL_TOTAL:)' || true
-
-# Reliable total size
-TOTAL_SIZE=$(echo "$PRUNE_OUTPUT" | grep -oP 'FINAL_TOTAL:\K[0-9]+' || echo 0)
-[[ -z "$TOTAL_SIZE" || "$TOTAL_SIZE" -eq 0 ]] && TOTAL_SIZE=$(ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" "
-    cd '${REMOTE_BACKUP_ROOT}' 2>/dev/null || true
-    du -scb backup-* 2>/dev/null | tail -n1 | cut -f1 || echo 0
-" || echo 0)
-
-# Update latest symlink
-ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" "ln -sfnr '${NEW_BACKUP_DIR}' '${REMOTE_BACKUP_ROOT}/latest'"
+# No second prune here: the pre-run prune of the next run enforces the limits,
+# and one du pass over the whole backup dir per run is enough.
+TOTAL_SIZE=$(( PRUNED_TOTAL + NEW_DATA_SIZE ))
 
 # Success notification
 SUCCESS_MSG="✅ Backup Success on ${HOSTNAME}
 📍 Source: $HOME
 📍 Destination: ${BACKUP_NAME}
-📊 Total size: $(bytes_to_human "$TOTAL_SIZE")
+📊 Total size: ~$(bytes_to_human "$TOTAL_SIZE")
 📊 New/changed data: $(bytes_to_human "$NEW_DATA_SIZE")"
 if (( ENABLE_DEBUG_LOG && TRANSFERRED_FILE_COUNT > 0 )); then
     SUCCESS_MSG+="
 📝 Debug log: ${DEBUG_LOG_REMOTE} (${TRANSFERRED_FILE_COUNT} files)"
+fi
+if [[ -n "$VANISHED_WARN" ]]; then
+    SUCCESS_MSG+="
+${VANISHED_WARN}"
+fi
+if [[ -n "$PRUNE_WARN" ]]; then
+    SUCCESS_MSG+="
+${PRUNE_WARN}"
 fi
 
 echo -e "\n$SUCCESS_MSG"
