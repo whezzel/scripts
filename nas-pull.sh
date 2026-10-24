@@ -21,6 +21,13 @@ INCLUDE_PATHS=(
     "temp"
 )
 
+# rsync --exclude patterns, matched relative to the pulled share (e.g.
+# "esphome/..."). For regenerable files the SSH user cannot read.
+EXCLUDE_PATTERNS=(
+    "/esphome/.esphome/dashboard-jobs/"
+    "/esphome/.device-builder-preferences.json"
+)
+
 # Entries of INCLUDE_PATHS that may legitimately be empty. Every other entry
 # must exist and be non-empty after the pull, otherwise the run fails (an
 # unmounted or missing source would otherwise give an empty "successful"
@@ -463,6 +470,7 @@ for rel_path in "${INCLUDE_PATHS[@]}"; do
         --itemize-changes \
         --ignore-missing-args --delete-missing-args \
         "${LINK_DEST_ARGS[@]}" \
+        "${EXCLUDE_PATTERNS[@]/#/--exclude=}" \
         "$remote_src" "$local_dest" >> "$RSYNC_LOG" 2>&1
     rsync_exit=$?
     set -e
