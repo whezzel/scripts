@@ -630,6 +630,12 @@ fi
 
 printf '%s\n' "${EXCLUDE_DIRS[@]}" > "$EXCLUDE_FILE"
 
+# === Package lists (restored with: pacman -S --needed - < ~/.pkglist-native) ===
+if command -v pacman >/dev/null; then
+    pacman -Qqen > "$HOME/.pkglist-native"  || echo "⚠️  Could not write native package list"
+    pacman -Qqem > "$HOME/.pkglist-foreign" || true   # AUR/local builds (e.g. age-plugin-tag); empty is fine
+fi
+
 # Rsync
 echo "Starting rsync..."
 
