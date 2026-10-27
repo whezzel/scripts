@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# kubectl-sops <verb> [-R] -f PATH... [kubectl args]
+# Decrypts SOPS files to a private tmpfs dir, passes each file to kubectl by path.
+set -euo pipefail
+umask 077
+verb=${1:?usage: kubectl-sops <verb> [-R] -f PATH...}; shift
+
+paths=(); args=(); recurse=0
+while (($#)); do
+  case $1 in
+    -R|--recursive)    recurse=1 ;;
+    -Rf|-fR)           recurse=1; paths+=("$2"); shift ;;
+    -f|--filename)     paths+=("$2"); shift ;;
+    -f=*|--filename=*) paths+=("${1#*=}") ;;
+    *)                 args+=("$1") ;;
+  esac
+  shift
+done
+
+# No files: plain kubectl
+((${#paths[@]})) || exec kubectl "$verb" "${args[@]}"
+
+files=(); fargs=()
+for p in "${paths[@]}"; do
+  if [[ $p == - || $p == http://* || $p == https://* ]]; then
+    fargs+=(-f "$p")                      # stdin/URL: pass through untouched
+  elif [[ -d $p ]]; then
+    depth=(-maxdepth 1); ((recurse)) && depth=()
+    while IFS= read -r -d '' f; do files+=("$f"); done < <(
+      find "$p" "${depth[@]}" -type f \( -name '*.yaml' -o -name '*.yml' -o -name '*.json' \) \
+        ! -name '.decrypted~*' -print0 | sort -z)
+  else
+    files+=("$p")
+  fi
+done
+
+tmp=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/kubectl-sops.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+
+for f in "${files[@]}"; do
+  if grep -qE '^sops:|^[[:space:]]*"sops":' "$f"; then
+    out="$tmp/$f"; mkdir -p "$(dirname "$out")"
+    if ! sops -d "$f" > "$out"; then
+      echo "kubectl-sops: decrypt failed: $f (nothing applied)" >&2; exit 1
+    fi
+    fargs+=(-f "$out")
+  else
+    fargs+=(-f "$f")
+  fi
+done
+
+kubectl "$verb" "${args[@]}" "${fargs[@]}"
