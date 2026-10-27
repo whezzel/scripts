@@ -30,6 +30,7 @@ EXCLUDE_DIRS=(
     ".bash_profile"
     ".bashrc"
     "documents/age.key"
+    ".config/sops"
 
     # === Browser caches - Brave (wildcards for all profiles) ===
     ".config/BraveSoftware/Brave-Browser/**/AutofillStrikeDatabase"
